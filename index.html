@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Solar System</title>
+<style>html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+canvas { display: block; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/speech-commands@0.4.0/dist/speech-commands.min.js"></script>
+</head><body><script>
+// VOICE SOLAR SYSTEM — p5.js (2D canvas, no WebGL) + Teachable Machine sound model
+p5.disableFriendlyErrors = true;   // IMPORTANT: p5's error-checker makes thousands of 3D/noise calls crawl
+// ---------- UI (injected so the sketch is one self-contained file) ----------
+function buildUI() {
+  const st = document.createElement('style');
+  st.textContent = `
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#dfe8ff}
+  canvas{display:block}
+  #status{position:fixed;top:14px;left:16px;font-size:13px;letter-spacing:.04em;opacity:.85;background:rgba(10,14,30,.55);padding:8px 12px;border-radius:10px;border:1px solid rgba(150,180,255,.2)}
+  #caption{position:fixed;left:0;right:0;bottom:70px;text-align:center;pointer-events:none;padding:0 16px}
+  #caption h1{margin:0;font-size:clamp(28px,5vw,54px);font-weight:200;letter-spacing:.3em;text-transform:uppercase;text-shadow:0 0 24px rgba(120,160,255,.7)}
+  #caption p{margin:8px auto 0;max-width:760px;font-size:14px;opacity:.8}
+  #btns{position:fixed;left:0;right:0;bottom:14px;display:flex;flex-wrap:wrap;gap:6px;justify-content:center;padding:0 10px}
+  #btns button{background:rgba(20,30,60,.6);color:#dfe8ff;border:1px solid rgba(150,180,255,.3);border-radius:999px;padding:6px 12px;font-size:12px;cursor:pointer}
+  #btns button:hover{background:rgba(70,100,200,.6)}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(0,0,10,.82);z-index:5;text-align:center;padding:20px}
+  #start button{font-size:18px;padding:14px 28px;border-radius:999px;border:1px solid #8fb0ff;background:#1a2a66;color:#fff;cursor:pointer}
+  #start small{opacity:.65;max-width:420px}
+`;
+  document.head.appendChild(st);
+  document.body.insertAdjacentHTML('beforeend', '<div id="diag" style="position:fixed;top:14px;right:16px;font:11px monospace;color:#8fa3d8;opacity:.8;z-index:4"></div>');
+  document.body.insertAdjacentHTML('beforeend', `
+<div id="status">Generating planets…</div>
+<div id="caption"><h1 id="cname"></h1><p id="cinfo"></p></div>
+<div id="btns"></div>
+<div id="start">
+  <div style="font-size:28px;font-weight:200;letter-spacing:.25em">VOICE SOLAR SYSTEM</div>
+  <div>Say a planet's name &mdash; or say "universe" to zoom out.</div>
+  <button id="go">🎙 Start listening</button>
+  <small>Allow microphone access when asked. You can also click the buttons at the bottom without a mic.</small>
+</div>
+
+`);
+}
+
+// ---------- CONFIG ----------
+const MODEL = 'https://teachablemachine.withgoogle.com/models/lGZ1ABd2q/';
+const THRESH = 0.8;
+const TF_BACKEND = null;      // null = default. If the sound model ever misbehaves, try 'cpu'.
+const TW = 512, TH = 256;    // planet texture size          // minimum confidence to react to a word
+
+// ---------- helpers ----------
+const D = d => d * Math.PI / 180;
+const sm = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const fb = (x, y, z, s, o = 0) => noise(x * s + o + 12, y * s + o + 12, z * s + o + 12);
+const adiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
+
+// ---------- procedural surface painters: (x,y,z unit-sphere coords, yy = -1 top..1 bottom, lon) -> [r,g,b] ----------
+const PAINT = {
+  sun: (x, y, z) => {
+    const n = fb(x, y, z, 4), m = fb(x, y, z, 10, 5), sp = fb(x, y, z, 3, 9);
+    let c = mix([230, 90, 10], [255, 235, 130], sm(.3, .75, n * .7 + m * .4));
+    return sp > .66 ? mix(c, [90, 30, 5], .7 * sm(.66, .75, sp)) : c;
+  },
+  mercury: (x, y, z) => {
+    let b = 95 + fb(x, y, z, 3) * 90;
+    b *= 1 - .35 * sm(.55, .75, fb(x, y, z, 9, 3));
+    b += sm(.7, .8, fb(x, y, z, 11, 7)) * 40;
+    return [b * 1.02, b * .97, b * .92];
+  },
+  venus: (x, y, z) => mix([205, 150, 80], [250, 225, 165], sm(.3, .7, fb(x, y * 3, z, 2.5) + .25 * fb(x, y, z, 8))),
+  earth: (x, y, z, yy) => {
+    const e = fb(x, y, z, 2.3) * .7 + fb(x, y, z, 5, 3) * .22 + fb(x, y, z, 10, 7) * .08;
+    const lat = Math.abs(yy), ice = sm(.82, .9, lat + (fb(x, y, z, 6, 2) - .5) * .2);
+    let c;
+    if (e < .54) c = mix([4, 22, 85], [22, 95, 175], sm(.3, .54, e));
+    else {
+      const m = fb(x, y, z, 3, 11);
+      c = mix([40, 110, 45], [205, 175, 115], sm(.5, .75, m) * (1 - lat * .8));
+      c = mix([215, 200, 140], c, sm(.54, .575, e));
+      c = mix(c, [150, 140, 130], sm(.68, .76, e));
+      c = mix(c, [250, 250, 250], sm(.76, .82, e));
+    }
+    return mix(c, [245, 248, 255], ice);
+  },
+  moon: (x, y, z) => {
+    const mare = sm(.5, .6, fb(x, y, z, 1.7, 6)), k = sm(.62, .7, fb(x, y, z, 11, 9));
+    let c = (130 + fb(x, y, z, 8, 2) * 70) * (1 - .4 * mare) * (1 - .25 * k) + sm(.75, .82, fb(x, y, z, 10, 4)) * 35;
+    return [c, c, c * .97];
+  },
+  mars: (x, y, z, yy) => {
+    const d = fb(x, y, z, 7, 4);
+    let c = mix([200, 105, 60], [120, 55, 35], sm(.5, .7, fb(x, y, z, 2.6)));
+    c = mix(c, [225, 150, 95], sm(.55, .75, d) * .5);
+    return mix(c, [245, 240, 235], sm(.88, .93, Math.abs(yy) + (d - .5) * .1));
+  },
+  jupiter: (x, y, z, yy, lon) => {
+    const b = .5 + .5 * Math.sin(yy * 21 + (fb(x, y * .3, z, 3) - .5) * 5);
+    let c = mix([150, 95, 65], [240, 220, 185], b);
+    c = mix(c, [190, 120, 80], sm(.4, .8, fb(x * 3, y * .4, z * 3, 3, 2)) * .4);
+    const g = Math.hypot(adiff(lon, 2.4) / .28, (yy - .33) / .075);   // Great Red Spot
+    if (g < 1.6) c = mix(c, mix([195, 70, 45], [225, 150, 110], sm(0, 1, g)), 1 - sm(.9, 1.6, g));
+    return c;
+  },
+  saturn: (x, y, z, yy) => {
+    const b = .5 + .5 * Math.sin(yy * 17 + (fb(x, y * .3, z, 3) - .5) * 3);
+    let c = mix([190, 160, 110], [240, 220, 170], b * .8 + fb(x, y * 2, z, 4) * .2);
+    return mix(c, [150, 150, 140], sm(.7, 1, Math.abs(yy)) * .4);
+  },
+  uranus: (x, y, z, yy) => {
+    let c = mix([130, 195, 210], [175, 225, 232], sm(.3, .7, fb(x, y * 2, z, 2)) * .7 + .15 * Math.sin(yy * 9));
+    return mix(c, [200, 240, 242], sm(.6, 1, Math.abs(yy)) * .35);
+  },
+  neptune: (x, y, z, yy, lon) => {
+    const b = .5 + .5 * Math.sin(yy * 13 + (fb(x, y * .4, z, 3) - .5) * 4);
+    let c = mix([28, 58, 185], [62, 112, 238], b);
+    c = mix(c, [235, 240, 255], sm(.7, .8, fb(x * 2, y * .6, z * 2, 4, 5)) * .6);
+    const g = Math.hypot(adiff(lon, 1.5) / .3, (yy + .25) / .14);       // Great Dark Spot
+    return g < 1.5 ? mix(c, [20, 30, 110], 1 - sm(.6, 1.5, g)) : c;
+  }
+};
+
+// ---------- body data (sizes/orbits are scaled for display; tilt, spin direction & rates are real) ----------
+const B = (n, R, fr, a, spd, tilt, hrs, info, extra) => Object.assign({ n, R, fr, a, spd, tilt, hrs, info, ang: n.length * 1.7, rot: 0, t: 0 }, extra);
+const bodies = [
+  B('sun', 50, 130, 0, 0, 7.25, 609, 'G-type star · 1.39 million km wide · rotates every ~25 days at the equator · surface ≈ 5,500 °C'),
+  B('mercury', 6, 100, 120, .024, 0, 1408, '4,879 km wide · one day lasts 59 Earth days · almost no atmosphere · −180 to 430 °C'),
+  B('venus', 11, 115, 170, .0165, 177, -5832, '12,104 km wide · spins backwards (243 Earth days) · tilt 177° · CO₂ clouds, 465 °C', { atm: [255, 215, 140, 38] }),
+  B('earth', 12, 120, 230, .0125, 23.4, 24, '12,742 km wide · 24 h day · tilt 23.4° · 71% ocean · 1 moon', { atm: [90, 160, 255, 42] }),
+  B('moon', 4, 105, 0, .05, 6.7, 655, '3,474 km wide · tidally locked to Earth · 27.3-day orbit · dark maria and impact craters'),
+  B('mars', 8, 108, 290, .0095, 25.2, 24.6, '6,779 km wide · 24.6 h day · tilt 25.2° · iron-oxide dust, polar ice caps · 2 moons', { atm: [255, 170, 120, 22] }),
+  B('jupiter', 32, 125, 390, .0055, 3.1, 9.9, '139,820 km wide · 9.9 h day, the fastest spinner · Great Red Spot storm · 90+ moons'),
+  B('saturn', 27, 85, 500, .004, 26.7, 10.7, '116,460 km wide · 10.7 h day · tilt 26.7° · rings of ice and rock · 100+ moons', { rings: true }),
+  B('uranus', 18, 100, 590, .003, 97.8, -17.2, '50,724 km wide · tilted 97.8°, rolls on its side · 17 h retrograde day · methane-blue'),
+  B('neptune', 17, 100, 670, .0024, 28.3, 16.1, '49,244 km wide · 16 h day · supersonic winds · Great Dark Spot · methane-blue')
+];
+const byName = n => bodies.find(b => b.n === n);
+
+// ---------- state ----------
+let ringTex, cloudTex, stars, focusName = null, fa = 0, camA = 0, queue = [];
+const FS = { sun: 1, moon: .85, saturn: .6 };   // on-screen size factor when a body is focused
+
+function setup() {
+  buildUI();
+  createCanvas(windowWidth, windowHeight);
+  pixelDensity(1);
+  noiseSeed(7); noiseDetail(4, .5);
+  document.getElementById('diag').textContent = 'p5 ' + (p5.VERSION || '?') + ' · 2D renderer · tf ' + (window.tf ? 'ok' : 'MISSING') + ' · speech-commands ' + (window.speechCommands ? 'ok' : 'MISSING');
+  queue = bodies.map(b => b.n).concat(['clouds', 'rings', 'stars']);
+  const bar = document.getElementById('btns');
+  [...bodies.map(b => b.n), 'universe'].forEach(n => {
+    const el = document.createElement('button');
+    el.textContent = n[0].toUpperCase() + n.slice(1);
+    el.onclick = () => handleName(n);
+    bar.appendChild(el);
+  });
+  document.getElementById('go').onclick = startListening;
+}
+
+// ---------- texture generation (plain pixel arrays) ----------
+function makeSurface(name, clouds) {
+  const out = new Uint8ClampedArray(TW * TH * 4);
+  for (let j = 0; j < TH; j++) {
+    const a = (j / TH - .5) * Math.PI, yy = Math.sin(a), cy = Math.cos(a);
+    for (let i = 0; i < TW; i++) {
+      const lon = i / TW * Math.PI * 2, x = cy * Math.cos(lon), z = cy * Math.sin(lon), k = 4 * (j * TW + i);
+      if (clouds) {
+        out[k] = out[k + 1] = out[k + 2] = 255;
+        out[k + 3] = sm(.5, .78, fb(x, yy * 1.6, z, 3.5) * .75 + fb(x, yy, z, 9, 4) * .25) * 215;
+      } else {
+        const c = PAINT[name](x, yy, z, yy, lon);
+        out[k] = c[0]; out[k + 1] = c[1]; out[k + 2] = c[2]; out[k + 3] = 255;
+      }
+    }
+  }
+  return out;
+}
+
+function makeRings() {
+  const g = createGraphics(512, 512);
+  g.pixelDensity(1); g.clear(); g.noFill(); g.strokeWeight(1.8);
+  for (let r = 138; r <= 256; r++) {
+    const u = (r - 138) / 118;
+    let d = .35 + .65 * noise(u * 28 + 3);
+    if (u < .2) d *= .35;
+    if (u > .6 && u < .65) d *= .04;
+    const c = mix([200, 175, 140], [235, 220, 190], noise(u * 9));
+    g.stroke(c[0], c[1], c[2], d * 235);
+    g.ellipse(256, 256, r * 2);
+  }
+  return g;
+}
+
+function makeStars() {
+  const pts = (n, band) => {
+    const a = [];
+    for (let i = 0; i < n; i++) {
+      const lon = random(Math.PI * 2), lat = band ? randomGaussian() * .12 + Math.sin(lon) * .35 : Math.asin(random(-1, 1)), cl = Math.cos(lat);
+      a.push([cl * Math.cos(lon), Math.sin(lat), cl * Math.sin(lon)]);
+    }
+    return a;
+  };
+  return { s: pts(2200, false), b: pts(140, false), d: pts(3000, true) };
+}
+
+// ---------- main loop ----------
+function draw() {
+  try { frame(); } catch (e) { showErr(e); noLoop(); }
+}
+
+function showErr(e) {
+  let el = document.getElementById('err');
+  if (!el) {
+    el = document.createElement('div'); el.id = 'err';
+    el.style.cssText = 'position:fixed;top:60px;left:16px;right:16px;color:#ff9a9a;font:13px monospace;background:rgba(40,0,0,.75);padding:10px;border-radius:8px;z-index:9;white-space:pre-wrap';
+    document.body.appendChild(el);
+  }
+  el.textContent = 'Draw error: ' + ((e && e.stack) || e);
+}
+
+function frame() {
+  const ctx = drawingContext, W = width, H = height;
+  if (queue.length) {
+    const q = queue.shift();
+    document.getElementById('status').textContent = 'Generating ' + q + '…';
+    if (q === 'clouds') cloudTex = makeSurface(null, true);
+    else if (q === 'rings') ringTex = makeRings();
+    else if (q === 'stars') stars = makeStars();
+    else byName(q).tex = makeSurface(q);
+    ctx.fillStyle = '#02030a'; ctx.fillRect(0, 0, W, H);
+    if (!queue.length) { document.getElementById('status').textContent = 'Ready - click Start listening'; handleName('universe'); }
+    return;
+  }
+
+  fa += ((focusName ? 1 : 0) - fa) * .06;
+  camA += .0007 * (1 - fa);
+  const pit = .5 - .3 * fa, cy = Math.cos(camA), sy = Math.sin(camA), cp = Math.cos(pit), sp = Math.sin(pit);
+  const sc = Math.min(W * .46 / 700, H * .36 / (700 * Math.sin(.5)));
+  const view = (x, y, z) => { const x1 = x * cy + z * sy, z1 = -x * sy + z * cy; return [x1, y * cp - z1 * sp, y * sp + z1 * cp]; };
+  const proj = v => { const k = 1 / (1 - v[2] / 1800); return [W / 2 + v[0] * sc * k, H * .46 - v[1] * sc * k, k]; };
+  const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+
+  ctx.fillStyle = '#02030a'; ctx.fillRect(0, 0, W, H);
+  // stars (infinitely far: only the camera rotation matters)
+  const K = W * .65;
+  const dots = (arr, size, col) => {
+    ctx.fillStyle = col;
+    for (const p of arr) { const v = view(p[0], p[1], p[2]); if (v[2] > 0) ctx.fillRect(W / 2 + v[0] * K, H / 2 - v[1] * K, size, size); }
+  };
+  dots(stars.d, 4, 'rgba(140,160,255,0.05)');
+  dots(stars.s, 1.3, 'rgba(255,255,255,0.75)');
+  dots(stars.b, 2.4, 'rgba(210,225,255,0.95)');
+
+  // body positions
+  const earth = byName('earth'), sun = byName('sun');
+  for (const b of bodies) {
+    b.ang += b.spd;
+    b.o = b.n === 'moon' ? [earth.o[0] + Math.cos(b.ang) * 26, 0, earth.o[2] + Math.sin(b.ang) * 26] : [Math.cos(b.ang) * b.a, 0, Math.sin(b.ang) * b.a];
+    b.t += ((focusName === b.n ? 1 : 0) - b.t) * .07;
+    b.rot = b.n === 'moon' ? b.ang : b.rot + Math.sign(b.hrs) * Math.min(.03, Math.max(.004, .29 / Math.abs(b.hrs)));
+    b.v = view(...b.o); b.pr = proj(b.v);
+  }
+  // orbit rings
+  if (fa < .97) {
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,' + (.13 * (1 - fa)) + ')';
+    for (const b of bodies) if (b.a) {
+      ctx.beginPath();
+      for (let i = 0; i <= 96; i++) { const a = i / 96 * Math.PI * 2, p = proj(view(Math.cos(a) * b.a, 0, Math.sin(a) * b.a)); i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); }
+      ctx.stroke();
+    }
+  }
+  // draw order: far to near; zoomed bodies last
+  const fx = W / 2, fy = H * .42, fr0 = Math.min(W * .26, H * .31);
+  const order = bodies.slice().sort((p, q) => (p.v[2] + p.t * 1e4) - (q.v[2] + q.t * 1e4));
+  for (const b of order) {
+    const e = sm(0, 1, b.t), vis = 1 - fa * (1 - b.t);
+    b.cx = b.pr[0] + (fx - b.pr[0]) * e; b.cy = b.pr[1] + (fy - b.pr[1]) * e;
+    const rOver = b.R * sc * b.pr[2], rFoc = fr0 * (FS[b.n] || .95);
+    b.rp = (rOver + (rFoc - rOver) * e) * vis;
+    if (b.rp < .6) continue;
+    const Ls = norm([sun.v[0] - b.v[0], sun.v[1] - b.v[1], sun.v[2] - b.v[2]]), Lk = norm([-.55, .45, .7]);
+    const L = norm([Ls[0] + (Lk[0] - Ls[0]) * e, Ls[1] + (Lk[1] - Ls[1]) * e, Ls[2] + (Lk[2] - Ls[2]) * e]);
+    drawBody(ctx, b, L, cy, sy, cp, sp);
+  }
+}
+
+function drawBody(ctx, b, L, cy, sy, cp, sp) {
+  const r = b.rp;
+  if (b.n === 'sun') {                       // corona
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(b.cx, b.cy, r * .7, b.cx, b.cy, r * 2.4);
+    g.addColorStop(0, 'rgba(255,150,40,0.55)'); g.addColorStop(.35, 'rgba(255,110,20,0.18)'); g.addColorStop(1, 'rgba(255,80,10,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(b.cx, b.cy, r * 2.4, 0, 7); ctx.fill(); ctx.restore();
+  }
+  let ring = null;
+  if (b.rings) {                             // Saturn's rings: ellipse from the axis tilt as seen by the camera
+    const ax = -Math.sin(D(b.tilt)), ay = Math.cos(D(b.tilt));
+    const x1 = ax * cy, z1 = -ax * sy, vx = x1, vy = ay * cp - z1 * sp, vz = ay * sp + z1 * cp;
+    const len = Math.hypot(vx, vy);
+    const dxs = len > 1e-4 ? -vy : 1, dys = len > 1e-4 ? vx : 0;          // major axis direction (view coords, y up)
+    const theta = Math.atan2(-dys, dxs);
+    const nearX = -vz * vx, nearY = vz * vy;                               // near-side direction in canvas coords
+    const nearPos = (nearX * -Math.sin(theta) + nearY * Math.cos(theta)) > 0;
+    ring = { theta, ratio: Math.max(.05, Math.abs(vz)), nearPos, Rr: r * 2.3 };
+  }
+  const drawHalf = front => {
+    if (!ring) return;
+    const side = front ? ring.nearPos : !ring.nearPos;
+    ctx.save(); ctx.translate(b.cx, b.cy); ctx.rotate(ring.theta); ctx.scale(1, ring.ratio);
+    ctx.beginPath(); ctx.rect(-ring.Rr, side ? 0 : -ring.Rr, ring.Rr * 2, ring.Rr); ctx.clip();
+    ctx.drawImage(ringTex.elt, -ring.Rr, -ring.Rr, ring.Rr * 2, ring.Rr * 2); ctx.restore();
+  };
+  drawHalf(false);
+  const rd = Math.max(4, Math.min(380, Math.round(r * 2)));
+  renderSphere(b, rd, L);
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(b.cv, 0, 0, rd, rd, b.cx - r, b.cy - r, r * 2, r * 2);
+  if (b.atm) {                               // thin atmosphere halo
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    const g = ctx.createRadialGradient(b.cx, b.cy, r * .97, b.cx, b.cy, r * 1.14), c = b.atm;
+    g.addColorStop(0, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + (c[3] / 140) + ')'); g.addColorStop(1, 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(b.cx, b.cy, r * 1.14, 0, 7); ctx.fill(); ctx.restore();
+  }
+  drawHalf(true);
+}
+
+// software-rendered, texture-mapped, lit sphere
+function renderSphere(b, rd, L) {
+  const cv = b.cv || (b.cv = document.createElement('canvas'));
+  if (cv.width !== 380) { cv.width = cv.height = 380; }
+  const c = cv.getContext('2d'), img = c.createImageData(rd, rd), px = img.data, tex = b.tex;
+  const ct = Math.cos(D(b.tilt)), st = Math.sin(D(b.tilt)), cr = Math.cos(b.rot), sr = Math.sin(b.rot);
+  const isSun = b.n === 'sun', cl = b.n === 'earth' ? cloudTex : null, cshift = b.rot * .12 + millis() * .00004, atm = b.atm;
+  const h = rd / 2, TAU = Math.PI * 2;
+  for (let j = 0; j < rd; j++) {
+    const v = -((j + .5) - h) / h;
+    for (let i = 0; i < rd; i++) {
+      const u = ((i + .5) - h) / h, r2 = u * u + v * v;
+      if (r2 > 1.04) continue;
+      const rr = Math.sqrt(r2), al = Math.min(1, Math.max(0, (1 - rr) * h + .5));
+      if (al <= 0) continue;
+      const nz = Math.sqrt(Math.max(0, 1 - r2));
+      const xp = u * ct + v * st, yp = -u * st + v * ct;
+      const xo = xp * cr - nz * sr, zo = xp * sr + nz * cr;
+      let lon = Math.atan2(zo, xo); if (lon < 0) lon += TAU;
+      const tx = lon / TAU * TW, ty = (.5 - Math.asin(Math.max(-1, Math.min(1, yp))) / Math.PI) * TH;
+      const ix = tx | 0, fx = tx - ix, ix1 = (ix + 1) % TW;
+      let t2 = ty - .5; if (t2 < 0) t2 = 0;
+      const iy = Math.min(TH - 2, t2 | 0), fy = Math.min(1, t2 - iy);
+      const k00 = (iy * TW + ix) * 4, k10 = (iy * TW + ix1) * 4, k01 = ((iy + 1) * TW + ix) * 4, k11 = ((iy + 1) * TW + ix1) * 4;
+      const w00 = (1 - fx) * (1 - fy), w10 = fx * (1 - fy), w01 = (1 - fx) * fy, w11 = fx * fy;
+      let R = tex[k00] * w00 + tex[k10] * w10 + tex[k01] * w01 + tex[k11] * w11;
+      let G = tex[k00 + 1] * w00 + tex[k10 + 1] * w10 + tex[k01 + 1] * w01 + tex[k11 + 1] * w11;
+      let B = tex[k00 + 2] * w00 + tex[k10 + 2] * w10 + tex[k01 + 2] * w01 + tex[k11 + 2] * w11;
+      let shade;
+      if (isSun) shade = .62 + .38 * Math.sqrt(nz);
+      else { let l = (u * L[0] + v * L[1] + nz * L[2] + .08) / 1.08; l = l < 0 ? 0 : l > 1 ? 1 : l; shade = .07 + .93 * l * (1.5 - .5 * l); }
+      if (cl) {
+        let lc = lon + cshift; lc -= TAU * Math.floor(lc / TAU);
+        const ca = cl[((Math.min(TH - 1, ty | 0)) * TW + ((lc / TAU * TW) | 0)) * 4 + 3] / 255 * .9;
+        R = R * (1 - ca) + 255 * ca; G = G * (1 - ca) + 255 * ca; B = B * (1 - ca) + 255 * ca;
+      }
+      R *= shade; G *= shade; B *= shade;
+      if (atm) { const rim = Math.pow(1 - nz, 3) * atm[3] / 40 * (.25 + shade); R += atm[0] * rim * .5; G += atm[1] * rim * .5; B += atm[2] * rim * .5; }
+      const o = (j * rd + i) * 4;
+      px[o] = R; px[o + 1] = G; px[o + 2] = B; px[o + 3] = al * 255;
+    }
+  }
+  c.putImageData(img, 0, 0);
+}
+
+// ---------- focus + voice ----------
+function handleName(n, silent) {
+  if (/universe|galaxy|solar|system|overview/.test(n)) { focusName = null; show('Solar System', 'Eight planets, the Sun and the Moon, orbiting. Say a planet\'s name to zoom in.'); return; }
+  const b = byName(n); if (!b) return;
+  focusName = b.n; show(b.n === 'moon' ? 'The Moon' : b.n, b.info);
+}
+function show(name, info) {
+  document.getElementById('cname').textContent = name;
+  document.getElementById('cinfo').textContent = info;
+}
+
+function handleLabel(label, conf) {
+  document.getElementById('status').textContent = `🎙 heard: ${label} (${Math.round(conf * 100)}%)`;
+  if (conf < THRESH) return;
+  const l = String(label).toLowerCase();
+  if (/background|noise/.test(l)) return;
+  if (/universe|galaxy|solar|system|overview/.test(l)) return handleName('universe');
+  const b = bodies.find(b => l.includes(b.n));
+  if (b) handleName(b.n);
+}
+
+async function startListening() {
+  document.getElementById('start').style.display = 'none';
+  const st = document.getElementById('status');
+  st.textContent = 'Loading sound model…';
+  try {
+    if (!window.tf || !window.speechCommands) throw new Error('TensorFlow / speech-commands scripts did not load - check index.html');
+    if (TF_BACKEND) await tf.setBackend(TF_BACKEND);
+    await tf.ready();
+    const rec = speechCommands.create('BROWSER_FFT', undefined, MODEL + 'model.json', MODEL + 'metadata.json');
+    await rec.ensureModelLoaded();
+    const labels = rec.wordLabels();
+    st.textContent = '🎙 Listening… say a planet name';
+    await rec.listen(res => {
+      const s = res.scores; let k = 0;
+      for (let i = 1; i < s.length; i++) if (s[i] > s[k]) k = i;
+      handleLabel(labels[k], s[k]);
+    }, { includeSpectrogram: false, probabilityThreshold: .5, invokeCallbackOnNoiseAndUnknown: true, overlapFactor: .5 });
+  } catch (e) {
+    st.textContent = 'Sound model error: ' + e.message;
+    console.error(e);
+  }
+}
+
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+</script></body></html>
